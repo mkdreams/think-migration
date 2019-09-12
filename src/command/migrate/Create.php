@@ -16,6 +16,7 @@ use think\console\Output;
 use think\migration\command\Migrate;
 use think\Db;
 use think\Env;
+use Phinx\Db\Adapter\MysqlAdapter;
 
 class Create extends Migrate
 {
@@ -28,6 +29,7 @@ class Create extends Migrate
         $this->setName('migrate:create')
              ->setDescription('Create a new migration')
              ->addArgument('name', InputArgument::REQUIRED, 'What is the name of the migration?')
+             ->addArgument('table', InputArgument::OPTIONAL, '')
              ->setHelp(sprintf('%sCreates a new database migration%s', PHP_EOL, PHP_EOL));
     }
 
@@ -77,11 +79,12 @@ class Create extends Migrate
         // Load the alternative template if it is defined.
         $contents = file_get_contents($this->getTemplate());
 
-        $this->getTableBuild();
+        $createTable = $this->getTableBuild($input->getArgument('table'));
         
         // inject the class names appropriate to this migration
         $contents = strtr($contents, [
             '$className' => $className,
+            '$createTable' => $createTable,
         ]);
 
         if (false === file_put_contents($filePath, $contents)) {
@@ -103,7 +106,7 @@ class Create extends Migrate
             $config = $this->getDbConfig();
             $db = $config['name'];
             $tableInfos = $this->getTablesInfos($tableName,$db);
-            $this->buildCreateTableSql($tableInfos);
+            return $this->buildCreateTableSql($tableInfos);
         }else{
             return '';
         }
@@ -137,7 +140,7 @@ class Create extends Migrate
             $tablesBaseInfos = array();
             foreach($res as $val) {
                 if(empty($val['TABLE_COMMENT'])) {
-                    $val['TABLE_COMMENT'] = '请添加表说明';
+                    $val['TABLE_COMMENT'] = '';
                 }
                 $tablesBaseInfos[$val['table_name']] = $val;
             }
@@ -179,34 +182,146 @@ class Create extends Migrate
      * @param array $tableInfos
      */
     private function buildCreateTableSql($tableInfos) {
+        $typeLimitMap = [];
+//         $typeLimitMap['TINYBLOB'] = 'BLOB_TINY';
+//         $typeLimitMap['BLOB'] = 'BLOB_REGULAR';
+//         $typeLimitMap['MEDIUMBLOB'] = 'BLOB_MEDIUM';
+//         $typeLimitMap['LONGBLOB'] = 'BLOB_LONG';
+
+        $typeLimitMap['TINYTEXT'] = MysqlAdapter::TEXT_TINY;
+        $typeLimitMap['TEXT'] = MysqlAdapter::TEXT_REGULAR;
+        $typeLimitMap['MEDIUMTEXT'] = MysqlAdapter::TEXT_MEDIUM;
+        $typeLimitMap['LONGTEXT'] = MysqlAdapter::TEXT_LONG;
+        
+        
+        $typeLimitMap['TINYINT'] = MysqlAdapter::INT_TINY;
+        $typeLimitMap['SMALLINT'] = MysqlAdapter::INT_SMALL;
+        $typeLimitMap['MEDIUMINT'] = MysqlAdapter::INT_MEDIUM;
+        $typeLimitMap['INT'] = MysqlAdapter::INT_REGULAR;
+        $typeLimitMap['BIGINT'] = MysqlAdapter::INT_BIG;
+        
+        $typeMap = [];
+        //         $typeMap['TINYBLOB'] = 'BLOB_TINY';
+        //         $typeMap['BLOB'] = 'BLOB_REGULAR';
+        //         $typeMap['MEDIUMBLOB'] = 'BLOB_MEDIUM';
+        //         $typeMap['LONGBLOB'] = 'BLOB_LONG';
+
+        $typeMap['TINYTEXT'] = 'text';
+        $typeMap['TEXT'] = 'text';
+        $typeMap['MEDIUMTEXT'] = 'text';
+        $typeMap['LONGTEXT'] = 'text';
+        
+        $typeMap['TINYINT'] = 'integer';
+        $typeMap['SMALLINT'] = 'integer';
+        $typeMap['MEDIUMINT'] = 'integer';
+        $typeMap['INT'] = 'integer';
+        $typeMap['BIGINT'] = 'integer';
+        
+        $typeMap['VARCHAR'] = 'string';
+        
+        $typeMap['TIMESTAMP'] = 'timestamp';
+        
+        MysqlAdapter::INT_SMALL;
+        
         $sql = '';
+        
+        
+        //表字段
+        foreach($tableInfos['fieldInfos'] as $fieldInfo) {
+            $TypeArr = explode('(', $fieldInfo['Type'],2);
+            $TypeArr = array_map(function($v) {
+                return trim($v,'()');
+            }, $TypeArr);
+            
+            
+            $type = strtoupper($TypeArr[0]);
+            
+            $options = [];
+            if(!empty($TypeArr[1])) {
+                $options['limit'] = $typeLimitMap[$type]??$TypeArr[1];
+            }
+            $options['default'] = $fieldInfo['Default'];
+            $options['comment'] = $fieldInfo['Comment'];
+            if($fieldInfo['Null'] == 'YES') {
+                $options['null'] = true;
+            }
+            
+            $optionsStr = var_export($options,true);
+            $type = $typeMap[$type]??$type;
+            
+            
+            $sql .= <<<SQL
+\$table->addColumn('{$fieldInfo['Field']}', '{$type}',{$optionsStr});
+SQL;
+            $sql .= PHP_EOL;
+        }
+        
+        
+        //索引
+        $tableIndexArr = [];
+        foreach($tableInfos['tableIndexs'] as $tableIndex) {
+            if(!isset($tableIndexArr[$tableIndex['Key_name']])) {
+                $tableIndexArr[$tableIndex['Key_name']] = [$tableIndex];
+            }else{
+                $tableIndexArr[$tableIndex['Key_name']][] = $tableIndex;
+            }
+        }
+        
+        $primary_key = [];
+        foreach($tableIndexArr as $tableIndexs) {
+            $fieldsArr = [];
+            $options = ['limit'=>[]];
+            foreach($tableIndexs as $tableIndex) {
+                $fieldsArr[] = $tableIndex['Column_name'];
+                $options['name'] = $tableIndex['Key_name'];
+                if($tableIndex['Non_unique'] === 0 && $tableIndex['Index_type'] == 'BTREE'){
+                    $primary_key[] = $tableIndex['Column_name'];
+                    continue 2;
+                }elseif($tableIndex['Index_type'] == 'BTREE'){
+                    $options['type'] = 'INDEX';
+                }elseif($tableIndex['Index_type'] == 'FULLTEXT') {
+                    $options['type'] = 'FULLTEXT';
+                }
+                
+                
+                if(!empty($tableIndex['Sub_part'])) {
+                    $options['limit'][$tableIndex['Column_name']] = $tableIndex['Sub_part'];
+                }
+            }
+            
+            $fieldsArrStr = var_export($fieldsArr,true);
+            $optionsStr = var_export($options,true);
+            
+            //索引
+            $sql .= <<<SQL
+\$table->addIndex({$fieldsArrStr}, {$optionsStr});
+SQL;
+            $sql .= PHP_EOL;
+        }
         
         //表基本信息
         $tableOptions = [];
         $tableOptions['engine'] = $tableInfos['tableBaseInfos']['ENGINE'];
         $tableOptions['collation'] = $tableInfos['tableBaseInfos']['TABLE_COLLATION'];
         $tableOptions['comment'] = $tableInfos['tableBaseInfos']['TABLE_COMMENT'];
-        $tableOptionsJson = json_encode($tableOptions);
+        if(!empty($primary_key)) {
+            $tableOptions['id'] = false;
+            $tableOptions['primary_key'] = $primary_key;
+        }
+        $tableOptionsStr = var_export($tableOptions,true);
         
-        //表字段
-        $sql .= <<<SQL
-        \$table = \$this->table('{$tableInfos['tableBaseInfos']['table_name']}',json_decode('$tableOptionsJson',true));
+        
+        $tabelBegain = <<<SQL
+\$table = \$this->table('{$tableInfos['tableBaseInfos']['table_name']}',{$tableOptionsStr});
 SQL;
-        
-        var_dump($tableInfos['fieldInfos']);exit;
-        $sql .= <<<SQL
-            \$table->addColumn('username', 'string',array('limit' => 15,'default'=>'','comment'=>'用户名，登陆使用'))
-            ->addColumn('password', 'string',array('limit' => 32,'default'=>md5('123456'),'comment'=>'用户密码'))
-            ->addColumn('login_status', 'boolean',array('limit' => 1,'default'=>0,'comment'=>'登陆状态'))
-            ->addColumn('login_code', 'string',array('limit' => 32,'default'=>0,'comment'=>'排他性登陆标识'))
-            ->addColumn('last_login_ip', 'integer',array('limit' => 11,'default'=>0,'comment'=>'最后登录IP'))
-            ->addColumn('is_delete', 'boolean',array('limit' => 1,'default'=>0,'comment'=>'删除状态，1已删除'))
-            ->addIndex(array('username'), array('unique' => true))
-            ->create();
+        $tabelEnd = <<<SQL
+\$table->create();
 SQL;
-        echo $sql;exit;
+        $sql = $tabelBegain.PHP_EOL.$sql.$tabelEnd;
         
-        var_dump($tableInfos['tableBaseInfos']);exit;
+        //格式化
+        $tab = '        ';
+        $sql = $tab.implode(PHP_EOL.$tab, preg_split("/\r\n|\n|\r/", $sql));
+        return $sql;
     }
-
 }

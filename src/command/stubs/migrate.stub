@@ -28,6 +28,6 @@ class $className extends Migrator
      */
     public function change()
     {
-		$createTable
+$createTable
     }
 }
